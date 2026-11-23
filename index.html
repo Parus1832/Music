@@ -94,7 +94,8 @@ async function scan(dir, path = '') {
   const found = [];
   for await (const [name, h] of dir.entries()) {
     if (h.kind === 'directory') found.push(...await scan(h, path + name + '/'));
-    else if (/\.(mp3|flac|m4a|mp4|aac|ogg|opus|wav)$/i.test(name));
+    else if (/\.(mp3|flac|m4a|mp4|aac|ogg|opus|wav)$/i.test(name)) found.push({ path: path + name, h });
+    
   }
   return found;
 }
