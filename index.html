@@ -11,13 +11,23 @@
 <style>
   body { font-family: system-ui, sans-serif; margin: 0 auto; padding: 12px; max-width: 720px; }
   button { font-size: 16px; padding: 10px 14px; margin: 3px 3px 3px 0; }
+  button.on { background: #2f4a3a; color: #fff; }
+  button.mini { font-size: 14px; padding: 6px 10px; margin: 0 0 0 4px; }
   audio { width: 100%; margin: 8px 0; }
   #now { font-weight: bold; margin: 8px 0 2px; }
-  #search { width: 100%; box-sizing: border-box; font-size: 16px; padding: 10px; margin: 8px 0; }
+  #search, #plname { width: 100%; box-sizing: border-box; font-size: 16px; padding: 10px; margin: 8px 0; }
+  #selbar { background: #fff6dd; padding: 6px 8px; margin: 6px 0; border-radius: 6px; }
+  #msg { color: #2f4a3a; font-weight: bold; min-height: 1.2em; }
+  #plhead { margin: 6px 0; }
+  #plbox { width: 100%; box-sizing: border-box; font-size: 13px; }
   ul { list-style: none; padding: 0; margin: 0; }
   li { padding: 10px 8px; border-bottom: 1px solid #ddd; cursor: pointer; }
   li small { display: block; color: #777; font-weight: normal; }
   li.cur { background: #e6efe6; font-weight: bold; }
+  li.sel { background: #fff0b8; }
+  li.row { display: flex; align-items: center; cursor: default; }
+  li.row .txt { flex: 1; cursor: pointer; }
+  li.row.missing .txt { color: #a33; cursor: default; }
   #log { color: #555; font-size: 13px; white-space: pre-wrap; }
 </style>
 </head>
@@ -36,14 +46,48 @@
   <button id="loop">🔁 ループなし</button>
 </div>
 
+<div>
+  <button id="vlib" class="on">ライブラリ</button>
+  <button id="vpl">プレイリスト</button>
+  <button id="selmode">選択</button>
+</div>
+<div id="msg"></div>
+
+<div id="selbar" hidden>
+  <div id="selcount"></div>
+  <input id="plname" placeholder="プレイリスト名（同じ名前なら追加）">
+  <button id="plsave">保存</button>
+  <button id="selcancel">キャンセル</button>
+</div>
+
+<div id="plhead" hidden>
+  <button id="plback">← 一覧</button>
+  <b id="plttl"></b><br>
+  <button id="plplay">▶ 再生</button>
+  <button id="pldel">削除</button>
+</div>
+
 <input id="search" type="search" placeholder="曲名・フォルダ名で検索">
 <ul id="list"></ul>
+
+<details id="bk" hidden>
+  <summary>バックアップ（書き出し・復元）</summary>
+  <button id="plexport">プレイリストをコピー</button>
+  <textarea id="plbox" rows="4" placeholder="コピーしたものをここに貼り付けて「復元」"></textarea>
+  <button id="plimport">復元</button>
+</details>
+
 <pre id="log"></pre>
 
 <script>
 const $ = id => document.getElementById(id);
-const audio = $('a'), listEl = $('list'), nowEl = $('now'), logEl = $('log');
+const audio = $('a'), listEl = $('list'), nowEl = $('now'), logEl = $('log'), msgEl = $('msg');
 const log = m => { logEl.textContent += m + '\n'; };
+const flash = m => {
+  msgEl.textContent = m;
+  clearTimeout(flash.t);
+  flash.t = setTimeout(() => { msgEl.textContent = ''; }, 4000);
+};
 
 // ---------- フォルダのハンドルを保存する小さなIndexedDB ----------
 const openDb = () => new Promise((res, rej) => {
@@ -74,12 +118,31 @@ const get = async k => {
 // 同じサイト（parus1832.github.io）内の他のアプリと保存先がぶつからないよう、名前に music. を付ける
 const SAVE_KEY = 'music.last';
 const LOOP_KEY = 'music.loop';
+const PL_KEY = 'music.playlists';
 let tracks = [];      // { path, h, title, folder, dir, key }
+let pathIndex = new Map();   // path → tracks の中の番号
 let current = -1;     // tracks の中で今の曲の番号
 let objectUrl = null;
 let playToken = 0;    // 連打したとき、古い読み込みを捨てるための札
 let pendingSeek = 0;  // 曲を読み込んだ後に移動する秒数
 let lastSave = 0;
+
+// プレイリスト： { id, name, paths: [曲のパス, ...] }
+let playlists = [];
+try { playlists = JSON.parse(localStorage.getItem(PL_KEY) || '[]'); } catch (e) { playlists = []; }
+if (!Array.isArray(playlists)) playlists = [];
+const savePlaylists = () => localStorage.setItem(PL_KEY, JSON.stringify(playlists));
+const plById = id => playlists.find(p => p.id === id);
+
+// 今どこから再生しているか：ライブラリ全体（ctxId = null）か、あるプレイリストか
+let ctxId = null;
+let ctxList = null;   // プレイリスト再生中：再生できる曲の番号の並び
+
+// 画面
+let view = 'lib';     // 'lib' ライブラリ / 'pl' プレイリスト一覧 / 'plx' プレイリストの中身
+let openId = null;
+let selMode = false;
+let selected = [];    // 選択モードで、タップした順の曲番号
 
 // ---------- 小さな道具 ----------
 // 全角半角・大文字小文字・カタカナ/ひらがなの揺れをそろえる（検索用）
@@ -95,32 +158,150 @@ async function scan(dir, path = '') {
   for await (const [name, h] of dir.entries()) {
     if (h.kind === 'directory') found.push(...await scan(h, path + name + '/'));
     else if (/\.(mp3|flac|m4a|mp4|aac|ogg|opus|wav)$/i.test(name)) found.push({ path: path + name, h });
-    
   }
   return found;
 }
 
+// ---------- プレイリストの再生範囲 ----------
+function buildCtxList(pl) {
+  return pl.paths.map(p => pathIndex.get(p)).filter(i => i !== undefined);
+}
+function setCtx(id) {
+  const pl = id ? plById(id) : null;
+  ctxId = pl ? pl.id : null;
+  ctxList = pl ? buildCtxList(pl) : null;
+  updateLoopLabel();
+}
+function refreshCtx() {        // プレイリストを編集したあと、再生範囲を作り直す
+  if (ctxId) setCtx(ctxId);
+}
+
 // ---------- 一覧の表示 ----------
 function render() {
-  const q = norm($('search').value.trim());
   listEl.textContent = '';
+  $('plhead').hidden = view !== 'plx';
+  $('search').hidden = view !== 'lib';
+  $('selmode').hidden = view !== 'lib';
+  $('selbar').hidden = !(view === 'lib' && selMode);
+  $('bk').hidden = view !== 'pl';
+  $('vlib').classList.toggle('on', view === 'lib');
+  $('vpl').classList.toggle('on', view !== 'lib');
+  $('selmode').classList.toggle('on', selMode);
+  if (view === 'lib') renderLib();
+  else if (view === 'pl') renderPlaylists();
+  else renderDetail();
+}
+
+function renderLib() {
+  $('selcount').textContent = selected.length + ' 曲を選択中（タップした順に並びます）';
+  const q = norm($('search').value.trim());
   tracks.forEach((t, i) => {
     if (q && !t.key.includes(q)) return;
     const li = document.createElement('li');
     li.dataset.i = i;
-    if (i === current) li.className = 'cur';
-    li.textContent = t.title;
+    let prefix = '';
+    if (selMode) {
+      const o = selected.indexOf(i);
+      if (o >= 0) { li.classList.add('sel'); prefix = (o + 1) + '. '; }
+    } else if (i === current) {
+      li.classList.add('cur');
+    }
+    li.textContent = prefix + t.title;
     if (t.folder) {
       const s = document.createElement('small');
       s.textContent = t.folder;
       li.appendChild(s);
     }
-    li.onclick = () => play(i);
+    li.onclick = () => {
+      if (selMode) {
+        const o = selected.indexOf(i);
+        if (o >= 0) selected.splice(o, 1); else selected.push(i);
+        render();
+      } else {
+        setCtx(null);
+        play(i);
+      }
+    };
     listEl.appendChild(li);
   });
 }
+
+function renderPlaylists() {
+  if (!playlists.length) {
+    const li = document.createElement('li');
+    li.style.cursor = 'default';
+    li.textContent = 'プレイリストはまだありません。「ライブラリ」で「選択」を押し、曲を選んで保存できます。';
+    listEl.appendChild(li);
+    return;
+  }
+  playlists.forEach(pl => {
+    const li = document.createElement('li');
+    li.textContent = pl.name;
+    const s = document.createElement('small');
+    s.textContent = pl.paths.length + ' 曲';
+    li.appendChild(s);
+    li.onclick = () => { openId = pl.id; view = 'plx'; render(); };
+    listEl.appendChild(li);
+  });
+}
+
+function renderDetail() {
+  const pl = plById(openId);
+  if (!pl) { view = 'pl'; render(); return; }
+  $('plttl').textContent = pl.name + '（' + pl.paths.length + '曲）';
+  if (!tracks.length && pl.paths.length) {
+    const li = document.createElement('li');
+    li.style.cursor = 'default';
+    li.textContent = 'フォルダを読み込むと、曲が再生できるようになります。';
+    listEl.appendChild(li);
+  }
+  pl.paths.forEach((path, p) => {
+    const idx = pathIndex.get(path);
+    const found = idx !== undefined;
+    const li = document.createElement('li');
+    li.className = 'row' + (found ? '' : ' missing');
+    li.dataset.i = found ? idx : -1;
+    if (found && idx === current && ctxId === pl.id) li.classList.add('cur');
+
+    const txt = document.createElement('div');
+    txt.className = 'txt';
+    txt.textContent = (p + 1) + '. ' + (found ? tracks[idx].title : baseName(path));
+    const s = document.createElement('small');
+    s.textContent = found ? tracks[idx].folder : (tracks.length ? '見つかりません' : '');
+    txt.appendChild(s);
+    txt.onclick = () => { if (found) { setCtx(pl.id); play(idx); } };
+    li.appendChild(txt);
+
+    const btn = (label, fn) => {
+      const b = document.createElement('button');
+      b.className = 'mini';
+      b.textContent = label;
+      b.onclick = e => { e.stopPropagation(); fn(); };
+      li.appendChild(b);
+    };
+    btn('↑', () => movePl(pl, p, -1));
+    btn('↓', () => movePl(pl, p, +1));
+    btn('✕', () => { pl.paths.splice(p, 1); savePlaylists(); refreshCtx(); render(); });
+    listEl.appendChild(li);
+  });
+}
+
+function movePl(pl, p, d) {
+  const q = p + d;
+  if (q < 0 || q >= pl.paths.length) return;
+  [pl.paths[p], pl.paths[q]] = [pl.paths[q], pl.paths[p]];
+  savePlaylists();
+  refreshCtx();
+  render();
+}
+
 function mark() {
-  listEl.querySelectorAll('li').forEach(li => li.classList.toggle('cur', +li.dataset.i === current));
+  listEl.querySelectorAll('li').forEach(li => {
+    if (selMode) return;
+    const i = +li.dataset.i;
+    const inThisView = view === 'lib' ? ctxId === null : ctxId === openId;
+    li.classList.toggle('cur', current >= 0 && i === current && inThisView);
+  });
 }
 
 // ---------- ロック画面などに出す曲情報 ----------
@@ -133,41 +314,54 @@ function setMeta(t) {
   });
 }
 
-// ---------- ループ設定（なし → 1曲 → アルバム） ----------
-const LOOP_LABEL = { off: '🔁 ループなし', one: '🔂 1曲', album: '🔁 アルバム' };
+// ---------- ループ設定（なし → 1曲 → アルバム／リスト） ----------
 let loopMode = localStorage.getItem(LOOP_KEY);
+function updateLoopLabel() {
+  $('loop').textContent =
+    loopMode === 'one' ? '🔂 1曲' :
+    loopMode === 'album' ? (ctxId ? '🔁 リスト' : '🔁 アルバム') :
+    '🔁 ループなし';
+}
 function setLoop(mode) {
-  loopMode = LOOP_LABEL[mode] ? mode : 'off';
+  loopMode = ['off', 'one', 'album'].includes(mode) ? mode : 'off';
   audio.loop = (loopMode === 'one');       // 1曲ループはブラウザ標準の機能に任せる
-  $('loop').textContent = LOOP_LABEL[loopMode];
   localStorage.setItem(LOOP_KEY, loopMode);
+  updateLoopLabel();
 }
 $('loop').onclick = () => setLoop(loopMode === 'off' ? 'one' : loopMode === 'one' ? 'album' : 'off');
 setLoop(loopMode);
 
-// 同じフォルダの中で、i の次の曲（最後なら先頭）／前の曲（先頭なら最後）
-function albumNext(i) {
-  const d = tracks[i].dir;
-  let first = -1;
-  for (let k = 0; k < tracks.length; k++) {
-    if (tracks[k].dir !== d) continue;
-    if (first < 0) first = k;
-    if (k > i) return k;
-  }
-  return first;
+// 「アルバムループ」の範囲：ライブラリ再生中は今の曲と同じフォルダの曲
+function groupIndices() {
+  const d = tracks[current].dir;
+  const out = [];
+  for (let k = 0; k < tracks.length; k++) if (tracks[k].dir === d) out.push(k);
+  return out;
 }
-function albumPrev(i) {
-  const d = tracks[i].dir;
-  let before = -1, last = -1;
-  for (let k = 0; k < tracks.length; k++) {
-    if (tracks[k].dir !== d) continue;
-    if (k < i) before = k;
-    last = k;
+
+// 次（dir = +1）または前（dir = -1）に再生する曲の番号。止まるときは -1
+function step(dir) {
+  if (current < 0) return -1;
+  if (ctxList) {                            // プレイリスト再生中
+    const pos = ctxList.indexOf(current);
+    if (pos < 0) return -1;
+    const p = pos + dir;
+    if (p >= 0 && p < ctxList.length) return ctxList[p];
+    return loopMode === 'album' ? ctxList[(p + ctxList.length) % ctxList.length] : -1;
   }
-  return before >= 0 ? before : last;
+  if (loopMode === 'album') {               // ライブラリ再生中：同じフォルダの中で回る
+    const g = groupIndices();
+    const pos = g.indexOf(current);
+    return g[(pos + dir + g.length) % g.length];
+  }
+  const n = current + dir;
+  return (n >= 0 && n < tracks.length) ? n : -1;
 }
 
 // ---------- 再生 ----------
+const persistLast = (path, time) =>
+  localStorage.setItem(SAVE_KEY, JSON.stringify({ path, time, pl: ctxId }));
+
 async function play(i, startAt = 0, autoplay = true) {
   const t = tracks[i];
   if (!t) return;
@@ -189,7 +383,7 @@ async function play(i, startAt = 0, autoplay = true) {
   document.title = t.title;
   setMeta(t);
   mark();
-  localStorage.setItem(SAVE_KEY, JSON.stringify({ path: t.path, time: startAt }));
+  persistLast(t.path, startAt);
   if (autoplay) {
     try { await audio.play(); }
     catch (e) { if (e.name !== 'AbortError') log('再生できませんでした: ' + e.message); }
@@ -197,16 +391,14 @@ async function play(i, startAt = 0, autoplay = true) {
 }
 
 function next() {
-  if (current < 0) return;
-  if (loopMode === 'album') play(albumNext(current));
-  else if (current + 1 < tracks.length) play(current + 1);
+  const n = step(+1);
+  if (n >= 0) play(n);
 }
 function prev() {
   if (current < 0) return;
   if (audio.currentTime > 3) { audio.currentTime = 0; return; }
-  if (loopMode === 'album') play(albumPrev(current));
-  else if (current > 0) play(current - 1);
-  else audio.currentTime = 0;
+  const n = step(-1);
+  if (n >= 0) play(n); else audio.currentTime = 0;
 }
 const seekBy = sec => {
   audio.currentTime = Math.max(0, Math.min(audio.duration || Infinity, audio.currentTime + sec));
@@ -216,7 +408,7 @@ const seekBy = sec => {
 function save(time = audio.currentTime) {
   const t = tracks[current];
   if (!t || audio.readyState < 1) return;
-  localStorage.setItem(SAVE_KEY, JSON.stringify({ path: t.path, time }));
+  persistLast(t.path, time);
 }
 audio.addEventListener('loadedmetadata', () => {
   if (pendingSeek) { audio.currentTime = pendingSeek; pendingSeek = 0; }
@@ -228,8 +420,9 @@ audio.addEventListener('pause', () => save());
 document.addEventListener('visibilitychange', () => { if (document.hidden) save(); });
 audio.addEventListener('ended', () => {
   // 1曲ループのときは audio.loop が処理するので、ここには来ない
-  if (loopMode === 'album' || current + 1 < tracks.length) next();   // 連続再生
-  else save(0);                                                       // 最後の曲なら先頭に戻しておく
+  const n = step(+1);
+  if (n >= 0) play(n);     // 連続再生
+  else save(0);            // 最後の曲なら先頭に戻しておく
 });
 
 // ---------- ボタン・検索 ----------
@@ -238,6 +431,85 @@ $('next').onclick = next;
 $('back').onclick = () => seekBy(-10);
 $('fwd').onclick = () => seekBy(10);
 $('search').addEventListener('input', render);
+
+// 表示の切り替え
+$('vlib').onclick = () => { view = 'lib'; render(); };
+$('vpl').onclick = () => { view = 'pl'; selMode = false; selected = []; render(); };
+$('selmode').onclick = () => { selMode = !selMode; selected = []; render(); };
+$('selcancel').onclick = () => { selMode = false; selected = []; render(); };
+
+// プレイリストを保存する（同じ名前があれば、そこに追加）
+$('plsave').onclick = () => {
+  const name = $('plname').value.trim();
+  if (!selected.length) return flash('曲が選ばれていません');
+  if (!name) return flash('プレイリスト名を入れてください');
+  let pl = playlists.find(p => p.name === name);
+  if (!pl) {
+    pl = { id: 'pl' + Date.now().toString(36), name, paths: [] };
+    playlists.push(pl);
+  }
+  let added = 0;
+  selected.forEach(i => {
+    const p = tracks[i].path;
+    if (!pl.paths.includes(p)) { pl.paths.push(p); added++; }
+  });
+  savePlaylists();
+  refreshCtx();
+  flash('「' + name + '」に ' + added + ' 曲を保存しました');
+  $('plname').value = '';
+  selMode = false;
+  selected = [];
+  render();
+};
+
+// プレイリストの中身の画面
+$('plback').onclick = () => { view = 'pl'; render(); };
+$('plplay').onclick = () => {
+  const pl = plById(openId);
+  if (!pl) return;
+  const list = buildCtxList(pl);
+  if (!list.length) return flash('再生できる曲がありません（フォルダを読み込んでください）');
+  setCtx(pl.id);
+  play(list[0]);
+};
+$('pldel').onclick = () => {
+  const pl = plById(openId);
+  if (!pl) return;
+  if (!confirm('プレイリスト「' + pl.name + '」を削除しますか？（曲のファイルは消えません）')) return;
+  playlists = playlists.filter(p => p.id !== pl.id);
+  savePlaylists();
+  if (ctxId === pl.id) setCtx(null);
+  view = 'pl';
+  render();
+};
+
+// バックアップ（ブラウザの保存データが消えたときの備え）
+$('plexport').onclick = async () => {
+  try {
+    await navigator.clipboard.writeText(JSON.stringify(playlists));
+    flash('コピーしました。メモ帳などに貼り付けて保管してください');
+  } catch (e) { flash('コピーできませんでした: ' + e.message); }
+};
+$('plimport').onclick = () => {
+  try {
+    const data = JSON.parse($('plbox').value);
+    if (!Array.isArray(data)) throw new Error('形式が違います');
+    let n = 0;
+    data.forEach(d => {
+      if (!d || typeof d.name !== 'string' || !Array.isArray(d.paths)) return;
+      const paths = d.paths.filter(p => typeof p === 'string');
+      const ex = playlists.find(p => p.name === d.name);
+      if (ex) ex.paths = paths;
+      else playlists.push({ id: 'pl' + Date.now().toString(36) + n, name: d.name, paths });
+      n++;
+    });
+    savePlaylists();
+    refreshCtx();
+    $('plbox').value = '';
+    flash(n + ' 件のプレイリストを復元しました');
+    render();
+  } catch (e) { flash('復元できませんでした: ' + e.message); }
+};
 
 // ---------- ロック画面・イヤホンのボタン ----------
 if ('mediaSession' in navigator) {
@@ -260,13 +532,17 @@ async function load(dir) {
   }));
   tracks.sort((a, b) => a.path.localeCompare(b.path, 'ja', { numeric: true }));
   tracks.forEach(t => { t.key = norm(t.path); });
+  pathIndex = new Map(tracks.map((t, i) => [t.path, i]));
   logEl.textContent = tracks.length + ' 曲見つかりました\n';
   current = -1;
-  render();
+  selected = [];
   const last = JSON.parse(localStorage.getItem(SAVE_KEY) || 'null');
-  const i = last ? tracks.findIndex(t => t.path === last.path) : -1;
-  if (i >= 0) await play(i, last.time, false);       // 前回の曲・位置で待機
-  else if (tracks.length) await play(0, 0, false);
+  setCtx(last && last.pl && plById(last.pl) ? last.pl : null);   // 前回がプレイリスト再生なら、その続き
+  render();
+  const i = last ? pathIndex.get(last.path) : undefined;
+  if (i !== undefined) await play(i, last.time, false);          // 前回の曲・位置で待機
+  else if (tracks.length) { setCtx(null); await play(0, 0, false); }
+  render();
 }
 
 if (!('showDirectoryPicker' in window)) log('このブラウザはフォルダ選択に対応していません。');
@@ -289,10 +565,15 @@ $('reuse').onclick = async () => {
   } catch (e) { if (e.name !== 'AbortError') log('エラー: ' + e.message); }
 };
 
+// ---------- 保存データが勝手に消されにくくなるよう、ブラウザにお願いしておく ----------
+if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+
 // ---------- PWA：オフラインでも起動できるようにする ----------
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('./sw.js').catch(e => log('Service Worker: ' + e.message));
 }
+
+render();
 </script>
 </body>
 </html>
