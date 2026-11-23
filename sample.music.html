@@ -1,12 +1,58 @@
-<button id="b">フォルダを選ぶ</button>
-<pre id="o"></pre>
+<button id="pick">フォルダを選ぶ</button>
+<button id="reuse">前回のフォルダを開く</button>
+<audio id="a" controls></audio>
+<pre id="log"></pre>
 <script>
-const o = document.getElementById('o');
-o.textContent = 'showDirectoryPicker: ' + ('showDirectoryPicker' in window);
-document.getElementById('b').onclick = async () => {
+const out = document.getElementById('log');
+const log = m => out.textContent += m + '\n';
+const audio = document.getElementById('a');
+
+// フォルダの「ハンドル」を保存する小さなIndexedDB
+const openDb = () => new Promise((res, rej) => {
+  const r = indexedDB.open('music', 1);
+  r.onupgradeneeded = () => r.result.createObjectStore('kv');
+  r.onsuccess = () => res(r.result);
+  r.onerror = () => rej(r.error);
+});
+const put = async (k, v) => { const d = await openDb();
+  return new Promise((res, rej) => { const t = d.transaction('kv', 'readwrite');
+    t.objectStore('kv').put(v, k); t.oncomplete = res; t.onerror = () => rej(t.error); }); };
+const get = async k => { const d = await openDb();
+  return new Promise((res, rej) => { const q = d.transaction('kv').objectStore('kv').get(k);
+    q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); };
+
+// フォルダ内の音声ファイルを再帰的に集める
+async function scan(dir, path = '') {
+  const found = [];
+  for await (const [name, h] of dir.entries()) {
+    if (h.kind === 'directory') found.push(...await scan(h, path + name + '/'));
+    else if (/\.(mp3|flac|m4a|aac|ogg|wav)$/i.test(name)) found.push({ path: path + name, h });
+  }
+  return found;
+}
+
+async function load(dir) {
+  const tracks = await scan(dir);
+  log(tracks.length + ' 曲見つかりました');
+  tracks.slice(0, 20).forEach(t => log(t.path));
+  if (tracks[0]) {
+    audio.src = URL.createObjectURL(await tracks[0].h.getFile());
+    log('先頭の曲をセットしました。再生ボタンを押してください');
+  }
+}
+
+document.getElementById('pick').onclick = async () => {
   const dir = await window.showDirectoryPicker();
-  const names = [];
-  for await (const [name, h] of dir.entries()) names.push(name);
-  o.textContent += '\n' + names.slice(0, 20).join('\n');
+  await put('dir', dir);
+  await load(dir);
+};
+
+document.getElementById('reuse').onclick = async () => {
+  const dir = await get('dir');
+  if (!dir) return log('保存されたフォルダがありません');
+  let p = await dir.queryPermission({ mode: 'read' });
+  log('権限の状態: ' + p);
+  if (p !== 'granted') p = await dir.requestPermission({ mode: 'read' });
+  if (p === 'granted') await load(dir); else log('許可されませんでした');
 };
 </script>
