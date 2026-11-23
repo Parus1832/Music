@@ -3,6 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#2f4a3a">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
 <title>Music</title>
 <style>
   body { font-family: system-ui, sans-serif; margin: 0 auto; padding: 12px; max-width: 720px; }
@@ -29,6 +33,7 @@
   <button id="back">⏪ 10</button>
   <button id="fwd">10 ⏩</button>
   <button id="next">⏭</button>
+  <button id="loop">🔁 ループなし</button>
 </div>
 
 <input id="search" type="search" placeholder="曲名・フォルダ名で検索">
@@ -66,8 +71,10 @@ const get = async k => {
 };
 
 // ---------- 状態 ----------
-const SAVE_KEY = 'last';
-let tracks = [];      // { path, h, title, folder, key }
+// 同じサイト（parus1832.github.io）内の他のアプリと保存先がぶつからないよう、名前に music. を付ける
+const SAVE_KEY = 'music.last';
+const LOOP_KEY = 'music.loop';
+let tracks = [];      // { path, h, title, folder, dir, key }
 let current = -1;     // tracks の中で今の曲の番号
 let objectUrl = null;
 let playToken = 0;    // 連打したとき、古い読み込みを捨てるための札
@@ -80,6 +87,7 @@ const norm = s => s.normalize('NFKC').toLowerCase()
   .replace(/[ァ-ヶ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60));
 const baseName = p => p.split('/').pop().replace(/\.[^.]+$/, '');
 const folderOf = p => { const a = p.split('/'); return a.length > 1 ? a[a.length - 2] : ''; };
+const dirOf = p => p.substring(0, p.lastIndexOf('/') + 1);   // 「アルバム」＝同じフォルダ
 
 // ---------- フォルダ内の音声ファイルを集める ----------
 async function scan(dir, path = '') {
@@ -124,6 +132,40 @@ function setMeta(t) {
   });
 }
 
+// ---------- ループ設定（なし → 1曲 → アルバム） ----------
+const LOOP_LABEL = { off: '🔁 ループなし', one: '🔂 1曲', album: '🔁 アルバム' };
+let loopMode = localStorage.getItem(LOOP_KEY);
+function setLoop(mode) {
+  loopMode = LOOP_LABEL[mode] ? mode : 'off';
+  audio.loop = (loopMode === 'one');       // 1曲ループはブラウザ標準の機能に任せる
+  $('loop').textContent = LOOP_LABEL[loopMode];
+  localStorage.setItem(LOOP_KEY, loopMode);
+}
+$('loop').onclick = () => setLoop(loopMode === 'off' ? 'one' : loopMode === 'one' ? 'album' : 'off');
+setLoop(loopMode);
+
+// 同じフォルダの中で、i の次の曲（最後なら先頭）／前の曲（先頭なら最後）
+function albumNext(i) {
+  const d = tracks[i].dir;
+  let first = -1;
+  for (let k = 0; k < tracks.length; k++) {
+    if (tracks[k].dir !== d) continue;
+    if (first < 0) first = k;
+    if (k > i) return k;
+  }
+  return first;
+}
+function albumPrev(i) {
+  const d = tracks[i].dir;
+  let before = -1, last = -1;
+  for (let k = 0; k < tracks.length; k++) {
+    if (tracks[k].dir !== d) continue;
+    if (k < i) before = k;
+    last = k;
+  }
+  return before >= 0 ? before : last;
+}
+
 // ---------- 再生 ----------
 async function play(i, startAt = 0, autoplay = true) {
   const t = tracks[i];
@@ -153,10 +195,17 @@ async function play(i, startAt = 0, autoplay = true) {
   }
 }
 
-function next() { if (current + 1 < tracks.length) play(current + 1); }
+function next() {
+  if (current < 0) return;
+  if (loopMode === 'album') play(albumNext(current));
+  else if (current + 1 < tracks.length) play(current + 1);
+}
 function prev() {
-  if (audio.currentTime > 3 || current <= 0) audio.currentTime = 0;
-  else play(current - 1);
+  if (current < 0) return;
+  if (audio.currentTime > 3) { audio.currentTime = 0; return; }
+  if (loopMode === 'album') play(albumPrev(current));
+  else if (current > 0) play(current - 1);
+  else audio.currentTime = 0;
 }
 const seekBy = sec => {
   audio.currentTime = Math.max(0, Math.min(audio.duration || Infinity, audio.currentTime + sec));
@@ -177,8 +226,9 @@ audio.addEventListener('timeupdate', () => {
 audio.addEventListener('pause', () => save());
 document.addEventListener('visibilitychange', () => { if (document.hidden) save(); });
 audio.addEventListener('ended', () => {
-  if (current + 1 < tracks.length) next();   // 連続再生
-  else save(0);                              // 最後の曲なら先頭に戻しておく
+  // 1曲ループのときは audio.loop が処理するので、ここには来ない
+  if (loopMode === 'album' || current + 1 < tracks.length) next();   // 連続再生
+  else save(0);                                                       // 最後の曲なら先頭に戻しておく
 });
 
 // ---------- ボタン・検索 ----------
@@ -205,11 +255,12 @@ if ('mediaSession' in navigator) {
 async function load(dir) {
   logEl.textContent = 'スキャン中…\n';
   tracks = (await scan(dir)).map(t => ({
-    ...t, title: baseName(t.path), folder: folderOf(t.path)
+    ...t, title: baseName(t.path), folder: folderOf(t.path), dir: dirOf(t.path)
   }));
   tracks.sort((a, b) => a.path.localeCompare(b.path, 'ja', { numeric: true }));
   tracks.forEach(t => { t.key = norm(t.path); });
   logEl.textContent = tracks.length + ' 曲見つかりました\n';
+  current = -1;
   render();
   const last = JSON.parse(localStorage.getItem(SAVE_KEY) || 'null');
   const i = last ? tracks.findIndex(t => t.path === last.path) : -1;
@@ -236,6 +287,11 @@ $('reuse').onclick = async () => {
     if (p === 'granted') await load(dir); else log('許可されませんでした');
   } catch (e) { if (e.name !== 'AbortError') log('エラー: ' + e.message); }
 };
+
+// ---------- PWA：オフラインでも起動できるようにする ----------
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('./sw.js').catch(e => log('Service Worker: ' + e.message));
+}
 </script>
 </body>
 </html>
