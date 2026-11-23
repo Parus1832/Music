@@ -1,41 +1,87 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Music</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0 auto; padding: 12px; max-width: 720px; }
+  button { font-size: 16px; padding: 10px 14px; margin: 3px 3px 3px 0; }
+  audio { width: 100%; margin: 8px 0; }
+  #now { font-weight: bold; margin: 8px 0 2px; }
+  #search { width: 100%; box-sizing: border-box; font-size: 16px; padding: 10px; margin: 8px 0; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { padding: 10px 8px; border-bottom: 1px solid #ddd; cursor: pointer; }
+  li small { display: block; color: #777; font-weight: normal; }
+  li.cur { background: #e6efe6; font-weight: bold; }
+  #log { color: #555; font-size: 13px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+
 <button id="pick">フォルダを選ぶ</button>
 <button id="reuse">前回のフォルダを開く</button>
-<audio id="a" controls></audio>
+
+<div id="now">（曲が選ばれていません）</div>
+<audio id="a" controls preload="metadata"></audio>
+<div>
+  <button id="prev">⏮</button>
+  <button id="back">⏪ 10</button>
+  <button id="fwd">10 ⏩</button>
+  <button id="next">⏭</button>
+</div>
+
+<input id="search" type="search" placeholder="曲名・フォルダ名で検索">
+<ul id="list"></ul>
 <pre id="log"></pre>
+
 <script>
-const out = document.getElementById('log');
-const log = m => out.textContent += m + '\n';
-const audio = document.getElementById('a');
+const $ = id => document.getElementById(id);
+const audio = $('a'), listEl = $('list'), nowEl = $('now'), logEl = $('log');
+const log = m => { logEl.textContent += m + '\n'; };
 
-// ① 保存まわり（scriptの先頭あたりに追加）
-const SAVE_KEY = 'last';
-let current = null;
-let lastSave = 0;
-function save() {
-  if (!current) return;
-  localStorage.setItem(SAVE_KEY, JSON.stringify({ path: current, time: audio.currentTime }));
-}
-audio.addEventListener('timeupdate', () => {
-  if (Date.now() - lastSave > 5000) { lastSave = Date.now(); save(); }
-});
-audio.addEventListener('pause', save);
-document.addEventListener('visibilitychange', () => { if (document.hidden) save(); });
-
-// フォルダの「ハンドル」を保存する小さなIndexedDB
+// ---------- フォルダのハンドルを保存する小さなIndexedDB ----------
 const openDb = () => new Promise((res, rej) => {
   const r = indexedDB.open('music', 1);
   r.onupgradeneeded = () => r.result.createObjectStore('kv');
   r.onsuccess = () => res(r.result);
   r.onerror = () => rej(r.error);
 });
-const put = async (k, v) => { const d = await openDb();
-  return new Promise((res, rej) => { const t = d.transaction('kv', 'readwrite');
-    t.objectStore('kv').put(v, k); t.oncomplete = res; t.onerror = () => rej(t.error); }); };
-const get = async k => { const d = await openDb();
-  return new Promise((res, rej) => { const q = d.transaction('kv').objectStore('kv').get(k);
-    q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); };
+const put = async (k, v) => {
+  const d = await openDb();
+  return new Promise((res, rej) => {
+    const t = d.transaction('kv', 'readwrite');
+    t.objectStore('kv').put(v, k);
+    t.oncomplete = res;
+    t.onerror = () => rej(t.error);
+  });
+};
+const get = async k => {
+  const d = await openDb();
+  return new Promise((res, rej) => {
+    const q = d.transaction('kv').objectStore('kv').get(k);
+    q.onsuccess = () => res(q.result);
+    q.onerror = () => rej(q.error);
+  });
+};
 
-// フォルダ内の音声ファイルを再帰的に集める
+// ---------- 状態 ----------
+const SAVE_KEY = 'last';
+let tracks = [];      // { path, h, title, folder, key }
+let current = -1;     // tracks の中で今の曲の番号
+let objectUrl = null;
+let playToken = 0;    // 連打したとき、古い読み込みを捨てるための札
+let pendingSeek = 0;  // 曲を読み込んだ後に移動する秒数
+let lastSave = 0;
+
+// ---------- 小さな道具 ----------
+// 全角半角・大文字小文字・カタカナ/ひらがなの揺れをそろえる（検索用）
+const norm = s => s.normalize('NFKC').toLowerCase()
+  .replace(/[ァ-ヶ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60));
+const baseName = p => p.split('/').pop().replace(/\.[^.]+$/, '');
+const folderOf = p => { const a = p.split('/'); return a.length > 1 ? a[a.length - 2] : ''; };
+
+// ---------- フォルダ内の音声ファイルを集める ----------
 async function scan(dir, path = '') {
   const found = [];
   for await (const [name, h] of dir.entries()) {
@@ -45,35 +91,151 @@ async function scan(dir, path = '') {
   return found;
 }
 
-async function load(dir) {
-  const tracks = await scan(dir);
-  log(tracks.length + ' 曲見つかりました');
-  tracks.slice(0, 20).forEach(t => log(t.path));
-
-  const last = JSON.parse(localStorage.getItem(SAVE_KEY) || 'null');
-  const t = (last && tracks.find(x => x.path === last.path)) || tracks[0];
-  if (t) {
-    current = t.path;
-    audio.src = URL.createObjectURL(await t.h.getFile());
-    if (last && last.path === t.path) {
-      audio.addEventListener('loadedmetadata', () => { audio.currentTime = last.time; }, { once: true });
+// ---------- 一覧の表示 ----------
+function render() {
+  const q = norm($('search').value.trim());
+  listEl.textContent = '';
+  tracks.forEach((t, i) => {
+    if (q && !t.key.includes(q)) return;
+    const li = document.createElement('li');
+    li.dataset.i = i;
+    if (i === current) li.className = 'cur';
+    li.textContent = t.title;
+    if (t.folder) {
+      const s = document.createElement('small');
+      s.textContent = t.folder;
+      li.appendChild(s);
     }
-    log('「' + t.path + '」をセットしました。再生ボタンを押してください');
+    li.onclick = () => play(i);
+    listEl.appendChild(li);
+  });
+}
+function mark() {
+  listEl.querySelectorAll('li').forEach(li => li.classList.toggle('cur', +li.dataset.i === current));
+}
+
+// ---------- ロック画面などに出す曲情報 ----------
+function setMeta(t) {
+  if (!('mediaSession' in navigator)) return;
+  navigator.mediaSession.metadata = new MediaMetadata({
+    title: t.title,
+    artist: t.folder || 'Music',
+    album: t.folder || ''
+  });
+}
+
+// ---------- 再生 ----------
+async function play(i, startAt = 0, autoplay = true) {
+  const t = tracks[i];
+  if (!t) return;
+  const my = ++playToken;
+  let file;
+  try {
+    file = await t.h.getFile();
+  } catch (e) {
+    log('ファイルを開けません。「前回のフォルダを開く」を押して許可し直してください。');
+    return;
+  }
+  if (my !== playToken) return;           // 読み込み中に別の曲が選ばれた
+  current = i;
+  pendingSeek = startAt;
+  if (objectUrl) URL.revokeObjectURL(objectUrl);
+  objectUrl = URL.createObjectURL(file);
+  audio.src = objectUrl;
+  nowEl.textContent = t.title;
+  document.title = t.title;
+  setMeta(t);
+  mark();
+  localStorage.setItem(SAVE_KEY, JSON.stringify({ path: t.path, time: startAt }));
+  if (autoplay) {
+    try { await audio.play(); }
+    catch (e) { if (e.name !== 'AbortError') log('再生できませんでした: ' + e.message); }
   }
 }
 
-document.getElementById('pick').onclick = async () => {
-  const dir = await window.showDirectoryPicker();
-  await put('dir', dir);
-  await load(dir);
+function next() { if (current + 1 < tracks.length) play(current + 1); }
+function prev() {
+  if (audio.currentTime > 3 || current <= 0) audio.currentTime = 0;
+  else play(current - 1);
+}
+const seekBy = sec => {
+  audio.currentTime = Math.max(0, Math.min(audio.duration || Infinity, audio.currentTime + sec));
 };
 
-document.getElementById('reuse').onclick = async () => {
-  const dir = await get('dir');
-  if (!dir) return log('保存されたフォルダがありません');
-  let p = await dir.queryPermission({ mode: 'read' });
-  log('権限の状態: ' + p);
-  if (p !== 'granted') p = await dir.requestPermission({ mode: 'read' });
-  if (p === 'granted') await load(dir); else log('許可されませんでした');
+// ---------- 再生位置の保存 ----------
+function save(time = audio.currentTime) {
+  const t = tracks[current];
+  if (!t || audio.readyState < 1) return;
+  localStorage.setItem(SAVE_KEY, JSON.stringify({ path: t.path, time }));
+}
+audio.addEventListener('loadedmetadata', () => {
+  if (pendingSeek) { audio.currentTime = pendingSeek; pendingSeek = 0; }
+});
+audio.addEventListener('timeupdate', () => {
+  if (Date.now() - lastSave > 5000) { lastSave = Date.now(); save(); }
+});
+audio.addEventListener('pause', () => save());
+document.addEventListener('visibilitychange', () => { if (document.hidden) save(); });
+audio.addEventListener('ended', () => {
+  if (current + 1 < tracks.length) next();   // 連続再生
+  else save(0);                              // 最後の曲なら先頭に戻しておく
+});
+
+// ---------- ボタン・検索 ----------
+$('prev').onclick = prev;
+$('next').onclick = next;
+$('back').onclick = () => seekBy(-10);
+$('fwd').onclick = () => seekBy(10);
+$('search').addEventListener('input', render);
+
+// ---------- ロック画面・イヤホンのボタン ----------
+if ('mediaSession' in navigator) {
+  const ms = navigator.mediaSession;
+  const on = (name, fn) => { try { ms.setActionHandler(name, fn); } catch (e) {} };
+  on('play', () => audio.play());
+  on('pause', () => audio.pause());
+  on('previoustrack', prev);
+  on('nexttrack', next);
+  on('seekbackward', e => seekBy(-(e.seekOffset || 10)));
+  on('seekforward', e => seekBy(e.seekOffset || 10));
+  on('seekto', e => { audio.currentTime = e.seekTime; });
+}
+
+// ---------- フォルダを読み込む ----------
+async function load(dir) {
+  logEl.textContent = 'スキャン中…\n';
+  tracks = (await scan(dir)).map(t => ({
+    ...t, title: baseName(t.path), folder: folderOf(t.path)
+  }));
+  tracks.sort((a, b) => a.path.localeCompare(b.path, 'ja', { numeric: true }));
+  tracks.forEach(t => { t.key = norm(t.path); });
+  logEl.textContent = tracks.length + ' 曲見つかりました\n';
+  render();
+  const last = JSON.parse(localStorage.getItem(SAVE_KEY) || 'null');
+  const i = last ? tracks.findIndex(t => t.path === last.path) : -1;
+  if (i >= 0) await play(i, last.time, false);       // 前回の曲・位置で待機
+  else if (tracks.length) await play(0, 0, false);
+}
+
+if (!('showDirectoryPicker' in window)) log('このブラウザはフォルダ選択に対応していません。');
+
+$('pick').onclick = async () => {
+  try {
+    const dir = await window.showDirectoryPicker();
+    await put('dir', dir);
+    await load(dir);
+  } catch (e) { if (e.name !== 'AbortError') log('エラー: ' + e.message); }
+};
+
+$('reuse').onclick = async () => {
+  try {
+    const dir = await get('dir');
+    if (!dir) return log('保存されたフォルダがありません');
+    let p = await dir.queryPermission({ mode: 'read' });
+    if (p !== 'granted') p = await dir.requestPermission({ mode: 'read' });
+    if (p === 'granted') await load(dir); else log('許可されませんでした');
+  } catch (e) { if (e.name !== 'AbortError') log('エラー: ' + e.message); }
 };
 </script>
+</body>
+</html>
