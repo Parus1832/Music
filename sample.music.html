@@ -7,6 +7,20 @@ const out = document.getElementById('log');
 const log = m => out.textContent += m + '\n';
 const audio = document.getElementById('a');
 
+// ① 保存まわり（scriptの先頭あたりに追加）
+const SAVE_KEY = 'last';
+let current = null;
+let lastSave = 0;
+function save() {
+  if (!current) return;
+  localStorage.setItem(SAVE_KEY, JSON.stringify({ path: current, time: audio.currentTime }));
+}
+audio.addEventListener('timeupdate', () => {
+  if (Date.now() - lastSave > 5000) { lastSave = Date.now(); save(); }
+});
+audio.addEventListener('pause', save);
+document.addEventListener('visibilitychange', () => { if (document.hidden) save(); });
+
 // フォルダの「ハンドル」を保存する小さなIndexedDB
 const openDb = () => new Promise((res, rej) => {
   const r = indexedDB.open('music', 1);
@@ -35,9 +49,16 @@ async function load(dir) {
   const tracks = await scan(dir);
   log(tracks.length + ' 曲見つかりました');
   tracks.slice(0, 20).forEach(t => log(t.path));
-  if (tracks[0]) {
-    audio.src = URL.createObjectURL(await tracks[0].h.getFile());
-    log('先頭の曲をセットしました。再生ボタンを押してください');
+
+  const last = JSON.parse(localStorage.getItem(SAVE_KEY) || 'null');
+  const t = (last && tracks.find(x => x.path === last.path)) || tracks[0];
+  if (t) {
+    current = t.path;
+    audio.src = URL.createObjectURL(await t.h.getFile());
+    if (last && last.path === t.path) {
+      audio.addEventListener('loadedmetadata', () => { audio.currentTime = last.time; }, { once: true });
+    }
+    log('「' + t.path + '」をセットしました。再生ボタンを押してください');
   }
 }
 
